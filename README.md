@@ -6,7 +6,7 @@
 ## 🔗 Live Demo  
 👉 https://meddoesdev.github.io/uncertainty-aware-bev/
 
-Note: Make sure to wait for 40-60s(sometimes visualisations may take 2mins to load) after clicking on the link.
+Note: Make sure to wait for 40-60s(sometimes visualisations may take upto 2 mins to load) after clicking on the link.
 
 ## What This Does
 
