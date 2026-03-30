@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+
+# Data
+nuscenes/
+*.json
+
+# Output
+output/
+
+# Mac
+.DS_Store
