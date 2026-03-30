@@ -6,6 +6,8 @@
 ## 🔗 Live Demo  
 👉 https://meddoesdev.github.io/uncertainty-aware-bev/
 
+Note: Make sure to wait for 40-60s(sometimes visualisations may take 2mins to load) after clicking on the link.
+
 ## What This Does
 
 Transforms surround-camera images from the nuScenes dataset into a **Bird's-Eye-View (BEV)
@@ -64,33 +66,12 @@ Self-contained HTML Dashboard (no server needed)
 pip install -r requirements.txt
 ```
 
-### 2. Download nuScenes mini
-- Go to https://www.nuscenes.org/nuscenes#download
-- Download **"Mini"** split (~4 GB)
-- Extract so your folder looks like:
-```
-nuscenes/
-  v1.0-mini/
-    sample.json
-    sample_data.json
-    calibrated_sensor.json
-    ego_pose.json
-    ...
-  samples/
-    CAM_FRONT/
-    CAM_FRONT_LEFT/
-    ...
-  sweeps/
-  maps/
-```
-
-### 3. Run the pipeline
+### 2. Run the pipeline
 ```bash
 python run_pipeline.py --dataroot /path/to/nuscenes --output ./output --max_samples 5
-python run_pipeline.py --dataroot /Users/medhanshnair/Downloads/v1.0-mini --output ./output --max_samples 5
 ```
 
-### 4. View the dashboard
+### 3. View the dashboard
 ```bash
 open output/bev_dashboard.html   # macOS
 # or just double-click the file
