@@ -107,14 +107,29 @@ def make_bev_world_grid(ego_pose):
 # IMAGE FEATURE SAMPLING  (bilinear)
 # ──────────────────────────────────────────────
 
+# How many pixels above the ground point to scan for obstacles.
+# At ~1m object height, a BEV cell 10m away projects ~80px upward.
+VERT_SCAN_STEPS = 12     # number of samples in the vertical column
+VERT_SCAN_PX    = 80     # total pixel height to scan above ground point
+
 def sample_image_features(img_np, px_coords, valid_mask):
     """
-    Bilinear-sample RGB features at sub-pixel locations.
-    img_np : (H, W, 3) float32 [0,1]
-    Returns (N, 3) feature array (zeros where invalid).
+    Enhanced feature sampling: for each BEV ground-plane point, sample a
+    vertical column of pixels ABOVE the ground projection.
+
+    Physics rationale:
+      - The ground-plane IPM point hits the road surface in the image.
+      - Any obstacle (car, barrier, wall) sitting on that ground cell
+        will appear ABOVE that pixel — at a height inversely proportional
+        to distance (closer = higher up in column, farther = smaller delta).
+      - We sample VERT_SCAN_STEPS positions up to VERT_SCAN_PX pixels above,
+        compute the column's variance and max-deviation-from-ground, and
+        return those as additional features alongside the ground RGB.
+
+    Returns (N, 6): [ground_R, ground_G, ground_B, col_var, col_sat, col_edge]
     """
     N      = px_coords.shape[0]
-    feat   = np.zeros((N, 3), dtype=np.float32)
+    feat   = np.zeros((N, 6), dtype=np.float32)
     H, W   = img_np.shape[:2]
 
     idx = np.where(valid_mask)[0]
@@ -128,11 +143,44 @@ def sample_image_features(img_np, px_coords, valid_mask):
     du = (u - u0)[:, None]
     dv = (v - v0)[:, None]
 
-    f  = (img_np[v0,   u0  ] * (1-du) * (1-dv)
-        + img_np[v0,   u0+1] *    du  * (1-dv)
-        + img_np[v0+1, u0  ] * (1-du) *    dv
-        + img_np[v0+1, u0+1] *    du  *    dv)
-    feat[idx] = f
+    # ── Ground-plane RGB (bilinear) ────────────────────────────────
+    ground_rgb = (img_np[v0,   u0  ] * (1-du) * (1-dv)
+                + img_np[v0,   u0+1] *    du  * (1-dv)
+                + img_np[v0+1, u0  ] * (1-du) *    dv
+                + img_np[v0+1, u0+1] *    du  *    dv)   # (M, 3)
+    feat[idx, :3] = ground_rgb
+
+    # ── Vertical column scan above ground point ────────────────────
+    # Sample VERT_SCAN_STEPS evenly-spaced rows above each ground px
+    steps   = np.linspace(0, VERT_SCAN_PX, VERT_SCAN_STEPS, dtype=np.float32)
+    col_rgb = np.zeros((len(idx), VERT_SCAN_STEPS, 3), dtype=np.float32)
+
+    for si, dy in enumerate(steps):
+        vs = np.clip(v0 - dy.astype(int), 0, H-2)   # scan upward (v decreases)
+        col_rgb[:, si, :] = (img_np[vs,   u0  ] * (1-du) * (1-dv)
+                           + img_np[vs,   u0+1] *    du  * (1-dv)
+                           + img_np[vs+1, u0  ] * (1-du) *    dv
+                           + img_np[vs+1, u0+1] *    du  *    dv)
+
+    # ── Column features ─────────────────────────────────────────────
+    # 1. Luminance variance along column: high = obstacle edge (colour change)
+    col_lum  = 0.299*col_rgb[:,:,0] + 0.587*col_rgb[:,:,1] + 0.114*col_rgb[:,:,2]
+    col_var  = col_lum.var(axis=1)                           # (M,)
+    col_var  = np.clip(col_var / 0.05, 0, 1)                # normalise
+
+    # 2. Max colour deviation from ground: obstacles differ from road colour
+    ground_lum = 0.299*ground_rgb[:,0] + 0.587*ground_rgb[:,1] + 0.114*ground_rgb[:,2]
+    col_dev  = np.abs(col_lum - ground_lum[:,None]).max(axis=1)
+    col_dev  = np.clip(col_dev / 0.3, 0, 1)
+
+    # 3. Saturation in upper half of column (sky is low-sat, obstacles higher)
+    upper    = col_rgb[:, VERT_SCAN_STEPS//2:, :]
+    mx       = upper.max(axis=2); mn = upper.min(axis=2)
+    col_sat  = ((mx - mn) / np.maximum(mx, 1e-6)).mean(axis=1)
+
+    feat[idx, 3] = col_var
+    feat[idx, 4] = col_dev
+    feat[idx, 5] = col_sat
     return feat
 
 # ──────────────────────────────────────────────
@@ -166,50 +214,47 @@ def local_variance(grid, radius=3):
 
 def luminance_to_occupancy(feat_rgb):
     """
-    Physics-inspired occupancy from RGB features.
+    Obstacle-aware occupancy using 6-channel features:
+      [0:3] Ground-plane RGB
+      [3]   Vertical column luminance variance  (high = obstacle edge)
+      [4]   Max colour deviation from ground    (high = something above road)
+      [5]   Upper-column saturation             (high = coloured object, not sky)
 
-    Key insight: in BEV-projected images, the GROUND PLANE maps to
-    near-uniform, low-saturation grey/brown patches (road, pavement).
-    OBSTACLES (cars, poles, walls) appear as:
-      - High local texture variance (edges from 3D surfaces)
-      - Non-grey colour (vehicles are coloured)
-      - Mid-range luminance (not sky-white, not shadow-black)
-
-    We compute all three and combine, then threshold softly.
+    Weighting philosophy:
+      - Column variance + deviation are PRIMARY signals — they directly
+        detect vertical discontinuities caused by standing obstacles.
+      - Ground RGB signals are SECONDARY — used for road colour suppression.
     """
     H, W = BEV_GRID_SIZE
     r, g, b = feat_rgb[:,0], feat_rgb[:,1], feat_rgb[:,2]
     lum = 0.299*r + 0.587*g + 0.114*b
 
-    # ── 1. Saturation (HSV-style) ─────────────────────────────
-    mx  = feat_rgb.max(axis=1)
-    mn  = feat_rgb.min(axis=1)
-    sat = (mx - mn) / np.maximum(mx, 1e-6)
+    # ── Primary: vertical column signals ──────────────────────
+    col_var = feat_rgb[:,3]   # column luminance variance
+    col_dev = feat_rgb[:,4]   # max colour deviation from ground
+    col_sat = feat_rgb[:,5]   # upper-column saturation
 
-    # ── 2. Luminance band: obstacles live in 0.15–0.70 ───────
-    # Road in Singapore daytime is ~0.25–0.40, sky ~0.75+
-    # We want to suppress both extremes
-    lum_score = np.exp(-8.0 * (lum - 0.38)**2)   # Gaussian centred at 0.38
+    # ── Secondary: ground-plane RGB signals ───────────────────
+    # Ground saturation
+    mx  = feat_rgb[:,:3].max(axis=1)
+    mn  = feat_rgb[:,:3].min(axis=1)
+    ground_sat = (mx - mn) / np.maximum(mx, 1e-6)
 
-    # ── 3. Local texture variance (reshape to 2D grid) ────────
+    # Road suppressor: flat grey road has low ground_sat AND low col_var
+    # Multiply to strongly suppress cells that score low on BOTH
+    road_suppressor = 1.0 - np.clip((1.0 - ground_sat) * (1.0 - col_var), 0, 1)
+
+    # ── 2D spatial variance (catches edges from building facades etc) ──
     lum_grid = lum.reshape(H, W)
     var_grid  = local_variance(lum_grid, radius=2)
-    # Normalise variance to [0,1]
-    var_norm  = var_grid / (var_grid.max() + 1e-8)
-    var_flat  = var_norm.ravel()
+    var_norm  = (var_grid / (var_grid.max() + 1e-8)).ravel()
 
-    # ── 4. Non-grey colour bias ────────────────────────────────
-    rg = np.abs(r - g)
-    rb = np.abs(r - b)
-    gb = np.abs(g - b)
-    colour_score = np.clip((rg + rb + gb) * 4.0, 0, 1)
-
-    # ── 5. Combine ─────────────────────────────────────────────
-    # Variance is the strongest signal — dominant weight
-    occ = (0.50 * var_flat
-         + 0.25 * sat
-         + 0.15 * colour_score
-         + 0.10 * lum_score)
+    # ── Combine — column signals dominate ──────────────────────
+    occ = (0.35 * col_var
+         + 0.30 * col_dev
+         + 0.15 * var_norm
+         + 0.12 * col_sat
+         + 0.08 * ground_sat) * road_suppressor
 
     # ── 6. Adaptive normalise with sigmoid sharpening ─────────
     # Stretch so median maps to ~0.3 (most of the scene is free space)
@@ -280,17 +325,17 @@ def mc_occupancy(feat_fused, n_samples=MC_SAMPLES):
 
     # Epistemic uncertainty = variance across MC samples
     uncert = preds.var(axis=0).reshape(H, W)
-    uncert = gaussian_blur_2d(uncert, sigma=1.0)
+    uncert = gaussian_blur_2d(uncert, sigma=2.0)
     uncert = uncert / (uncert.max() + 1e-8)
 
     # ── Spatial post-processing on occupancy grid ──────────────
     occ_grid = mean.reshape(H, W)
 
     # 1. Median filter: kills isolated salt-and-pepper noise
-    occ_grid = median_filter_2d(occ_grid, size=5)
+    occ_grid = median_filter_2d(occ_grid, size=7)
 
     # 2. First Gaussian pass: broad smoothing (sigma=5 ≈ 2.5m at 0.5m/px)
-    occ_grid = gaussian_blur_2d(occ_grid, sigma=3.0)
+    occ_grid = gaussian_blur_2d(occ_grid, sigma=5.0)
 
     # 3. Percentile stretch
     lo = np.percentile(occ_grid, 5)
@@ -298,7 +343,7 @@ def mc_occupancy(feat_fused, n_samples=MC_SAMPLES):
     occ_grid = np.clip((occ_grid - lo) / (hi - lo + 1e-8), 0, 1)
 
     # 4. Second finer Gaussian pass: shape the blobs
-    occ_grid = gaussian_blur_2d(occ_grid, sigma=1.5)
+    occ_grid = gaussian_blur_2d(occ_grid, sigma=3.0)
 
     # 5. Edge enhancement via unsharp mask (adds structure back in)
     blurred_for_edge = gaussian_blur_2d(occ_grid, sigma=1.5)
@@ -1162,7 +1207,7 @@ def main():
 
         pts_world = make_bev_world_grid(ego_pose)
         H, W      = BEV_GRID_SIZE
-        feat_acc   = np.zeros((H*W, 3), dtype=np.float32)
+        feat_acc   = np.zeros((H*W, 6), dtype=np.float32)
         weight_acc = np.zeros(H*W,      dtype=np.float32)
         loaded_imgs = {}
 
