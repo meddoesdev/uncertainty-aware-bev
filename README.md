@@ -3,6 +3,9 @@
 
 ---
 
+## 🔗 Live Demo  
+👉 https://meddoesdev.github.io/uncertainty-aware-bev/
+
 ## What This Does
 
 Transforms surround-camera images from the nuScenes dataset into a **Bird's-Eye-View (BEV)
